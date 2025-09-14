@@ -1,29 +1,43 @@
+# ema_crossover_github_dual.py
+# Dual timeframe EMA: 2h (9/16) for bias, 15m (9/16) for entries
+
 import os
 import ccxt
 import pandas as pd
-from datetime import datetime, timezone
 import requests
+from datetime import datetime, timezone
+from tqdm import tqdm
+import time
 
 # === Config ===
 symbols = [
-    "1000RATS/USDT:USDT", "1000SHIB/USDT:USDT", "1000BONK/USDT:USDT",
-    "1000FLOKI/USDT:USDT", "1000CAT/USDT:USDT", "1000PEPE/USDT:USDT"
+    "KOMA/USDT:USDT","DOGS/USDT:USDT","NEIRO/USDT:USDT",
+    "ORDI/USDT:USDT","MEME/USDT:USDT","PIPPIN/USDT:USDT","BAN/USDT:USDT",
+    "OM/USDT:USDT","CHILLGUY/USDT:USDT","PONKE/USDT:USDT",
+    "BOME/USDT:USDT","MYRO/USDT:USDT","PEOPLE/USDT:USDT","PENGU/USDT:USDT",
+    "SPX/USDT:USDT","PNUT/USDT:USDT","FARTCOIN/USDT:USDT",
+    "HIPPO/USDT:USDT","AIXBT/USDT:USDT","BRETT/USDT:USDT","VINE/USDT:USDT",
+    "MOODENG/USDT:USDT","MUBARAK/USDT:USDT","MEW/USDT:USDT","POPCAT/USDT:USDT",
+    "DOGE/USDT:USDT","ACT/USDT:USDT",
+    "SLERF/USDT:USDT","DEGEN/USDT:USDT","WIF/USDT:USDT"
 ]
 
-exchanges_to_check = [
-    'bybit','okx','gateio','kucoin','huobi','coinex',
-    'binanceusdm','kraken','phemex','bitget'
-]
+primary_exchanges = ['binanceusdm','bybit','okx']
+secondary_exchanges = ['gateio','kucoin','huobi','coinex','kraken','phemex','bitget']
 
-timeframe = "2h"
-ema_fast, ema_slow = 12, 50
-max_age_minutes = 150  # only use candles <= 150 minutes old
+# EMA settings
+ema_fast, ema_slow, ema_long = 9, 16, 200
+max_age_minutes = 150
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage" if TELEGRAM_TOKEN else None
+TG_MAX = 4000
 
 # === Helpers ===
 def get_ema(df, length):
     return df['close'].ewm(span=length, adjust=False).mean()
 
-def fetch_candles(exchange, symbol, tf="2h", limit=100):
+def fetch_candles(exchange, symbol, tf="2h", limit=200):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=limit)
         df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
@@ -34,14 +48,32 @@ def fetch_candles(exchange, symbol, tf="2h", limit=100):
 
 def minutes_ago(ts):
     now = datetime.now(timezone.utc)
-    diff = now - ts
-    return int(diff.total_seconds() // 60)
+    return int((now - ts).total_seconds() // 60)
 
-# === Main Logic ===
+def send_telegram_text_chunks(text):
+    if not TELEGRAM_API or not TELEGRAM_CHAT:
+        print("Telegram not configured.")
+        return
+    lines = text.splitlines()
+    chunks, cur = [], ""
+    for line in lines:
+        if len(cur) + len(line) + 1 <= TG_MAX:
+            cur += line + "\n"
+        else:
+            if cur: chunks.append(cur)
+            cur = line + "\n"
+    if cur: chunks.append(cur)
+    for chunk in chunks:
+        try:
+            requests.post(TELEGRAM_API, data={"chat_id": TELEGRAM_CHAT, "text": chunk}, timeout=15)
+            time.sleep(0.4)
+        except Exception as e:
+            print("Telegram send failed:", e)
+
+# === Evaluation ===
 def evaluate(symbol):
-    signal = None
     details = []
-
+    exchanges_to_check = primary_exchanges + secondary_exchanges
     for ex_id in exchanges_to_check:
         try:
             ex_class = getattr(ccxt, ex_id)
@@ -49,57 +81,77 @@ def evaluate(symbol):
             if not exchange.has.get("fetchOHLCV", False):
                 continue
 
-            df = fetch_candles(exchange, symbol, tf=timeframe, limit=100)
-            if df.empty:
-                continue
+            # Boss chart: 2h 9/16
+            df_2h = fetch_candles(exchange, symbol, tf="2h", limit=200)
+            if df_2h.empty: continue
 
-            df["ema12"] = get_ema(df, ema_fast)
-            df["ema50"] = get_ema(df, ema_slow)
+            df_2h["ema9"] = get_ema(df_2h, ema_fast)
+            df_2h["ema16"] = get_ema(df_2h, ema_slow)
+            df_2h["ema200"] = get_ema(df_2h, ema_long)
 
-            last = df.iloc[-1]
-            mins = minutes_ago(last["time"])
-            if mins > max_age_minutes:
-                continue
+            last_2h = df_2h.iloc[-1]
+            if minutes_ago(last_2h["time"]) > max_age_minutes: continue
 
-            # Short-only condition (relaxed)
-            if last["ema12"] < last["ema50"]:
-                signal = f"{symbol} ({ex_id.upper()}) @ {last['close']:.6f} | EMA12={last['ema12']:.4f}, EMA50={last['ema50']:.4f}"
-                details.append(signal)
-                break  # Stop after first exchange providing data
+            # Only bearish bias if EMA9 < EMA16
+            boss_ok = last_2h["ema9"] < last_2h["ema16"]
+            strong = boss_ok and (last_2h["ema16"] < last_2h["ema200"])
+            if not boss_ok:
+                details.append(f"{symbol} ({ex_id.upper()}) skipped - 2h EMA9>=EMA16 (no bearish bias)")
+                return None, details, False
+
+            # Entry chart: 15m 9/16
+            df_15m = fetch_candles(exchange, symbol, tf="15m", limit=50)
+            if df_15m.empty: continue
+
+            df_15m["ema9"] = get_ema(df_15m, ema_fast)
+            df_15m["ema16"] = get_ema(df_15m, ema_slow)
+
+            last_15m = df_15m.iloc[-1]
+            prev_15m = df_15m.iloc[-2]
+
+            bearish_cross = (prev_15m["ema9"] >= prev_15m["ema16"]) and (last_15m["ema9"] < last_15m["ema16"])
+            tag = "✅ Strong" if strong else "⚠ Weak"
+            signal = f"SHORT SIGNAL: {symbol} ({ex_id.upper()}) @ {last_15m['close']:.6f} | {tag}" if bearish_cross else None
+
+            details.append(
+                f"{symbol} ({ex_id.upper()}) @ {last_15m['close']:.6f} | "
+                f"2h EMA9={last_2h['ema9']:.4f}, EMA16={last_2h['ema16']:.4f}, EMA200={last_2h['ema200']:.4f} {tag} | "
+                f"15m EMA9={last_15m['ema9']:.4f}, EMA16={last_15m['ema16']:.4f} | 15m_cross={'YES' if bearish_cross else 'NO'}"
+            )
+
+            return signal, details, False
 
         except Exception:
             continue
 
-    if not details:
-        details.append(f"{symbol} not available on any exchange")
-    return details
+    return None, [f"{symbol} not available on any exchange"], True
 
+# === Main ===
 def main():
-    all_details = []
+    signals, details_all, missing = [], [], []
+    total, processed, strong_count, weak_count = len(symbols), 0, 0, 0
 
-    for sym in symbols:
-        det = evaluate(sym)
-        all_details.extend(det)
+    for sym in tqdm(symbols, desc="Checking coins", unit="coin"):
+        sig, det, is_missing = evaluate(sym)
+        details_all.extend(det)
+        if is_missing:
+            missing.append(sym)
+        else:
+            processed += 1
+        if sig:
+            signals.append(sig)
+            if "✅ Strong" in sig: strong_count += 1
+            else: weak_count += 1
 
-    # Print results
-    print("=== COIN DATA CHECK ===")
-    for d in all_details:
-        print(d)
-
-    # Send to Telegram
-    tg_token = os.getenv("TELEGRAM_TOKEN")
-    tg_chat = os.getenv("TELEGRAM_CHAT_ID")
-    if tg_token and tg_chat:
-        try:
-            url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-            message = "\n".join(all_details)
-            # Telegram has a 4096 character limit per message
-            if len(message) > 4000:
-                message = message[:4000] + "\n[Message truncated]"
-            requests.post(url, data={"chat_id": tg_chat, "text": message}, timeout=10)
-            print("✅ Sent to Telegram")
-        except Exception as e:
-            print("Telegram failed:", e)
+    # Telegram message
+    lines = ["=== SHORT SIGNALS ==="]
+    lines.extend(signals if signals else ["No valid short signals this run."])
+    lines.append("\n=== MISSING COINS ===")
+    lines.extend(missing if missing else ["None"])
+    lines.append(f"\n=== SUMMARY ===\nChecked: {total} | Processed: {processed} | Missing: {len(missing)} | Signals: {len(signals)} (Strong: {strong_count}, Weak: {weak_count})")
+    final_text = "\n".join(lines)
+    send_telegram_text_chunks(final_text)
+    print(final_text)
 
 if __name__ == "__main__":
     main()
