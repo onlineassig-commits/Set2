@@ -1,5 +1,6 @@
-# ema_crossover_15m.py
+# ema_crossover_15m_relaxed.py
 # Single timeframe EMA: 15m (9/16/200)
+# Relaxed rules: current trend mode + price filter + lookback window
 
 import os
 import ccxt
@@ -28,6 +29,7 @@ secondary_exchanges = ['gateio','kucoin','huobi','coinex','kraken','phemex','bit
 # EMA settings
 ema_fast, ema_slow, ema_long = 9, 16, 200
 max_age_minutes = 150
+lookback_candles = 5
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage" if TELEGRAM_TOKEN else None
@@ -91,24 +93,35 @@ def evaluate(symbol):
             df["ema200"] = get_ema(df, ema_long)
 
             last = df.iloc[-1]
-            prev = df.iloc[-2]
 
             if minutes_ago(last["time"]) > max_age_minutes:
                 continue
 
-            # Bearish crossover condition
-            bearish_cross = (prev["ema9"] >= prev["ema16"]) and (last["ema9"] < last["ema16"])
+            # Relaxed rule: EMA9 below EMA16 (trend mode)
+            ema_condition = last["ema9"] < last["ema16"]
 
-            # Trend filter: both EMAs below 200
-            strong = bearish_cross and (last["ema16"] < last["ema200"] and last["ema9"] < last["ema200"])
-            tag = "✅ Strong" if strong else ("⚠ Weak" if bearish_cross else "")
+            # Lookback rule: crossover happened within last N candles
+            cross_recent = False
+            for i in range(1, lookback_candles+1):
+                prev = df.iloc[-(i+1)]
+                curr = df.iloc[-i]
+                if prev["ema9"] >= prev["ema16"] and curr["ema9"] < curr["ema16"]:
+                    cross_recent = True
+                    break
 
-            signal = f"SHORT SIGNAL: {symbol} ({ex_id.upper()}) @ {last['close']:.6f} | {tag}" if bearish_cross else None
+            # Trend filter: price < EMA200
+            trend_ok = last["close"] < last["ema200"]
+
+            # Final signal
+            bearish_signal = ema_condition and cross_recent and trend_ok
+            tag = "✅ Strong" if bearish_signal else ""
+
+            signal = f"SHORT SIGNAL: {symbol} ({ex_id.upper()}) @ {last['close']:.6f} | {tag}" if bearish_signal else None
 
             details.append(
                 f"{symbol} ({ex_id.upper()}) @ {last['close']:.6f} | "
                 f"EMA9={last['ema9']:.4f}, EMA16={last['ema16']:.4f}, EMA200={last['ema200']:.4f} "
-                f"| 15m_cross={'YES' if bearish_cross else 'NO'} {tag}"
+                f"| ema_condition={'YES' if ema_condition else 'NO'}, cross_recent={'YES' if cross_recent else 'NO'}, price<200={'YES' if trend_ok else 'NO'} {tag}"
             )
 
             return signal, details, False
@@ -121,7 +134,7 @@ def evaluate(symbol):
 # === Main ===
 def main():
     signals, details_all, missing = [], [], []
-    total, processed, strong_count, weak_count = len(symbols), 0, 0, 0
+    total, processed, strong_count = len(symbols), 0, 0
 
     for sym in tqdm(symbols, desc="Checking coins", unit="coin"):
         sig, det, is_missing = evaluate(sym)
@@ -132,16 +145,15 @@ def main():
             processed += 1
         if sig:
             signals.append(sig)
-            if "✅ Strong" in sig: strong_count += 1
-            elif "⚠ Weak" in sig: weak_count += 1
+            strong_count += 1
 
     # Telegram message
-    lines = ["=== SHORT SIGNALS (15m EMA crossover) ==="]
+    lines = ["=== SHORT SIGNALS (15m EMA relaxed crossover) ==="]
     lines.extend(signals if signals else ["No valid short signals this run."])
     lines.append("\n=== MISSING COINS ===")
     lines.extend(missing if missing else ["None"])
     lines.append(f"\n=== SUMMARY ===\nChecked: {total} | Processed: {processed} | Missing: {len(missing)} | "
-                 f"Signals: {len(signals)} (Strong: {strong_count}, Weak: {weak_count})")
+                 f"Signals: {len(signals)} (Strong: {strong_count})")
     final_text = "\n".join(lines)
     send_telegram_text_chunks(final_text)
     print(final_text)
