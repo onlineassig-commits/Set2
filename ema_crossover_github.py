@@ -273,12 +273,12 @@ def run_once():
     else:
         lines.append("No signals this run.")
 
-    lines.append("\n=== Open Positions ===")
-    if open_positions:
-        for sym, pos in open_positions.items():
-            lines.append(f"{sym} @ {pos['entry']:.6f} ({pos['exchange']}) | TP={pos['tp']:.6f} SL={pos['sl']:.6f}")
-    else:
-        lines.append("None")
+  #  lines.append("\n=== Open Positions ===")
+  #  if open_positions:
+   #     for sym, pos in open_positions.items():
+  #          lines.append(f"{sym} @ {pos['entry']:.6f} ({pos['exchange']}) | TP={pos['tp']:.6f} SL={pos['sl']:.6f}")
+ #  else:
+ #       lines.append("None")
 
     final_text = "\n".join(lines)
     send_telegram_text_chunks(final_text)
