@@ -1,7 +1,3 @@
-# short_only_strategy.py (with fast Supertrend + corrected symbols)
-# Short-only strategy with multi-timeframe EMA filter (15m + 1h) + Supertrend
-# Relaxed EMA slope rule, broader pullback, ATR-based exits, closed-candle enforcement
-
 import os
 import ccxt
 import pandas as pd
@@ -20,20 +16,25 @@ symbols = [
     "DOGE/USDT","1000CAT/USDT","ACT/USDT","SLERF/USDT","DEGEN/USDT","WIF/USDT",
     "1000PEPE/USDT"
 ]
+
 primary_exchanges = ['binanceusdm','bybit','okx']
 secondary_exchanges = ['gateio','kucoin','huobi','coinex','kraken','phemex','bitget']
 
 rsi_len = 14
-max_age_minutes = 30  # tightened freshness: ~≤ 2 bars on 15m
+max_age_minutes = 30
 
 # ATR-based exits
 atr_len = 14
-atr_tp_mult = 1.5  # TP = 1.5 * ATR(14)
-atr_sl_mult = 1.0  # SL = 1.0 * ATR(14)
+atr_tp_mult = 1.5
+atr_sl_mult = 1.0
 
-# Supertrend params (fast responding)
+# Supertrend params
 st_atr_period = 7
 st_mult = 2.0
+
+# Volume filter
+vol_window = 20  # compare last candle volume to average of last 20
+vol_mult = 1.5   # must be 1.5x average
 
 # Telegram settings
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -157,21 +158,10 @@ def evaluate(symbol):
             df15["atr14"] = get_atr(df15, atr_len)
             df15 = get_supertrend(df15, atr_period=st_atr_period, multiplier=st_mult)
 
-            last15 = df15.iloc[-2]  # closed
-            prev15 = df15.iloc[-3]
+            last15 = df15.iloc[-2]  # closed candle
 
             if minutes_ago(last15["time"]) > max_age_minutes:
                 continue
-
-            # --- 1h timeframe filter ---
-            df1h = fetch_candles(exchange, symbol, tf="1h", limit=200)
-            if df1h.empty or len(df1h) < 60:
-                continue
-            df1h["ema9"] = get_ema(df1h, 9)
-            df1h["ema21"] = get_ema(df1h, 21)
-            last1h = df1h.iloc[-2]
-
-            higher_tf_down = last1h["ema9"] < last1h["ema21"]
 
             # === ENTRY ===
             if symbol not in open_positions:
@@ -181,23 +171,13 @@ def evaluate(symbol):
                     and last15["close"] < last15["ema21"]
                 )
 
-                rsi_pullback = last15["rsi"] > 50
-
-                def near_dynamic_ma(df, idx, pct_tol=0.003):
-                    row = df.iloc[idx]
-                    close = row["close"]
-                    d21 = abs(close - row["ema21"]) / close
-                    d50 = abs(close - row["ema50"]) / close
-                    return (d21 <= pct_tol) or (d50 <= pct_tol)
-
-                recent_near = (
-                    near_dynamic_ma(df15, -2) or near_dynamic_ma(df15, -3) or near_dynamic_ma(df15, -4)
-                )
-                pullback_ok = rsi_pullback or recent_near
-
                 supertrend_short = (not last15["in_uptrend"]) and (last15["close"] < last15["supertrend"])
 
-                if higher_tf_down and trend_down and pullback_ok and supertrend_short:
+                # Volume confirmation
+                avg_vol = df15["volume"].iloc[-vol_window-2:-2].mean()
+                vol_ok = last15["volume"] > vol_mult * avg_vol
+
+                if trend_down and supertrend_short and vol_ok:
                     entry_price = last15["close"]
                     entry_atr = df15["atr14"].iloc[-2]
                     if pd.isna(entry_atr) or entry_atr <= 0:
@@ -259,7 +239,7 @@ def run_once():
         else:
             missing.append(sym)
 
-    lines = [f"=== SHORT STRATEGY (15m + 1h EMA filter + Supertrend; Exits: TP={atr_tp_mult}xATR, SL={atr_sl_mult}xATR) ==="]
+    lines = [f"=== SHORT STRATEGY (15m Supertrend + EMA trend + Volume Surge; Exits: TP={atr_tp_mult}xATR, SL={atr_sl_mult}xATR) ==="]
     if signals:
         for s in signals:
             if s["type"] == "entry":
@@ -272,13 +252,6 @@ def run_once():
                 )
     else:
         lines.append("No signals this run.")
-
-  #  lines.append("\n=== Open Positions ===")
-  #  if open_positions:
-   #     for sym, pos in open_positions.items():
-  #          lines.append(f"{sym} @ {pos['entry']:.6f} ({pos['exchange']}) | TP={pos['tp']:.6f} SL={pos['sl']:.6f}")
- #  else:
- #       lines.append("None")
 
     final_text = "\n".join(lines)
     send_telegram_text_chunks(final_text)
