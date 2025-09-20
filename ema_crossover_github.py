@@ -1,263 +1,157 @@
-import os
+"""
+rt_github.py — Pump→Dump Screener (GitHub-friendly, single run)
+---------------------------------------------------------------
+- Scans your meme coin list across multiple exchanges
+- Detects pump + confirm
+- Outputs ONLY ranked coin names (one per line, highest score first)
+
+Dependencies: pip install ccxt pandas numpy rich tqdm
+"""
+
 import ccxt
 import pandas as pd
-import requests
-from datetime import datetime, timezone
+import numpy as np
+from datetime import timedelta
 from tqdm import tqdm
-import time
+import warnings
+warnings.filterwarnings("ignore")
 
-# === Config ===
-symbols = [
-    "KOMA/USDT","DOGS/USDT","NEIROETH/USDT","1000RATS/USDT","ORDI/USDT","MEME/USDT",
-    "PIPPIN/USDT","BAN/USDT","1000SHIB/USDT","OM/USDT","CHILLGUY/USDT","PONKE/USDT",
-    "BOME/USDT","MYRO/USDT","PEOPLE/USDT","PENGU/USDT","SPX/USDT","1000BONK/USDT",
-    "PNUT/USDT","FARTCOIN/USDT","HIPPO/USDT","AIXBT/USDT","BRETT/USDT","VINE/USDT",
-    "MOODENG/USDT","MUBARAK/USDT","MEW/USDT","POPCAT/USDT","1000FLOKI/USDT",
-    "DOGE/USDT","1000CAT/USDT","ACT/USDT","SLERF/USDT","DEGEN/USDT","WIF/USDT",
-    "1000PEPE/USDT"
+# ---------------- USER CONFIG ----------------
+COIN_LIST = [
+    'DOGE/USDT','SHIB/USDT','PEPE/USDT','WIF/USDT','BONK/USDT','FLOKI/USDT','MEME/USDT',
+    'KOMA/USDT','DOGS/USDT','NEIROETH/USDT','1000RATS/USDT','ORDI/USDT','PIPPIN/USDT',
+    'BAN/USDT','1000SHIB/USDT','OM/USDT','CHILLGUY/USDT','PONKE/USDT','BOME/USDT',
+    'MYRO/USDT','PEOPLE/USDT','PENGU/USDT','SPX/USDT','1000BONK/USDT','PNUT/USDT',
+    'FARTCOIN/USDT','HIPPO/USDT','AIXBT/USDT','BRETT/USDT','VINE/USDT','MOODENG/USDT',
+    'MUBARAK/USDT','MEW/USDT','POPCAT/USDT','1000FLOKI/USDT','1000CAT/USDT','ACT/USDT',
+    'SLERF/USDT','DEGEN/USDT','1000PEPE/USDT'
 ]
 
-primary_exchanges = ['binanceusdm','bybit','okx']
-secondary_exchanges = ['gateio','kucoin','huobi','coinex','kraken','phemex','bitget']
+EXCHANGE_LIST = ['binance', 'bybit', 'okx', 'kucoin']
 
-rsi_len = 14
-max_age_minutes = 30
+ROLL_1H = 100
+ROLL_15M = 200
+WATCH_HOURS = 6
 
-# ATR-based exits
-atr_len = 14
-atr_tp_mult = 1.5
-atr_sl_mult = 1.0
+# thresholds
+Z_RET_THRESHOLD = 1.8
+Z_VOL_THRESHOLD = 2.0
+VOL_MULT_15 = 3.0
+BETA_CLOSE_NEAR_LOW = 0.30
 
-# Supertrend params
-st_atr_period = 7
-st_mult = 2.0
+EMA_FAST = 21
+EMA_SLOW = 50
 
-# Volume filter
-vol_window = 20  # compare last candle volume to average of last 20
-vol_mult = 1.5   # must be 1.5x average
-
-# Telegram settings
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID")
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage" if TELEGRAM_TOKEN else None
-TG_MAX = 4000
-
-# Track open positions
-open_positions = {}
-
-# === Helpers ===
-def get_ema(df, length):
-    return df['close'].ewm(span=length, adjust=False).mean()
-
-def get_rsi(df, length=14):
-    delta = df['close'].diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/length, adjust=False).mean()
-    loss = -delta.clip(upper=0).ewm(alpha=1/length, adjust=False).mean()
-    rs = gain / loss.replace(0, 1e-10)
-    return 100 - (100 / (1 + rs))
-
-def get_atr(df, length=14):
-    prev_close = df['close'].shift(1)
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - prev_close).abs()
-    tr3 = (df['low'] - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/length, adjust=False).mean()
-    return atr
-
-def get_supertrend(df, atr_period=7, multiplier=2.0):
-    hl2 = (df['high'] + df['low']) / 2
-    atr = get_atr(df, atr_period)
-
-    upperband = hl2 + (multiplier * atr)
-    lowerband = hl2 - (multiplier * atr)
-
-    final_upperband = upperband.copy()
-    final_lowerband = lowerband.copy()
-
-    for i in range(1, len(df)):
-        if df['close'].iloc[i-1] > final_upperband.iloc[i-1]:
-            final_upperband.iloc[i] = upperband.iloc[i]
-        else:
-            final_upperband.iloc[i] = min(upperband.iloc[i], final_upperband.iloc[i-1])
-
-        if df['close'].iloc[i-1] < final_lowerband.iloc[i-1]:
-            final_lowerband.iloc[i] = lowerband.iloc[i]
-        else:
-            final_lowerband.iloc[i] = max(lowerband.iloc[i], final_lowerband.iloc[i-1])
-
-    supertrend = pd.Series(index=df.index, dtype='float64')
-    in_uptrend = pd.Series(index=df.index, dtype='bool')
-
-    for i in range(len(df)):
-        if df['close'].iloc[i] > final_upperband.iloc[i]:
-            in_uptrend.iloc[i] = True
-        elif df['close'].iloc[i] < final_lowerband.iloc[i]:
-            in_uptrend.iloc[i] = False
-        else:
-            in_uptrend.iloc[i] = in_uptrend.iloc[i-1] if i > 0 else True
-
-        supertrend.iloc[i] = final_lowerband.iloc[i] if in_uptrend.iloc[i] else final_upperband.iloc[i]
-
-    df['supertrend'] = supertrend
-    df['in_uptrend'] = in_uptrend
-    return df
-
-def fetch_candles(exchange, symbol, tf="15m", limit=200):
+# ---------------- HELPERS ----------------
+def get_exchange(exchange_id):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-        return df
+        ex_class = getattr(ccxt, exchange_id)
+        return ex_class({'enableRateLimit': True})
     except Exception:
-        return pd.DataFrame()
+        return None
 
-def minutes_ago(ts):
-    now = datetime.now(timezone.utc)
-    return int((now - ts).total_seconds() // 60)
-
-def send_telegram_text_chunks(text):
-    if not TELEGRAM_API or not TELEGRAM_CHAT:
-        print("Telegram not configured.")
-        return
-    lines = text.splitlines()
-    chunks, cur = [], ""
-    for line in lines:
-        if len(cur) + len(line) + 1 <= TG_MAX:
-            cur += line + "\n"
-        else:
-            if cur: chunks.append(cur)
-            cur = line + "\n"
-    if cur: chunks.append(cur)
-    for chunk in chunks:
+def fetch_ohlcv_fallback(symbol: str, timeframe: str, limit: int = 500):
+    for ex_id in EXCHANGE_LIST:
+        ex = get_exchange(ex_id)
+        if ex is None: continue
         try:
-            requests.post(TELEGRAM_API, data={"chat_id": TELEGRAM_CHAT, "text": chunk}, timeout=15)
-            time.sleep(0.4)
-        except Exception as e:
-            print("Telegram send failed:", e)
-
-# === Strategy ===
-def evaluate(symbol):
-    exchanges_to_check = primary_exchanges + secondary_exchanges
-    for ex_id in exchanges_to_check:
-        try:
-            ex_class = getattr(ccxt, ex_id)
-            exchange = ex_class({'options': {'defaultType':'future'}})
-            if not exchange.has.get("fetchOHLCV", False):
+            ex.load_markets()
+            if not getattr(ex, 'has', {}).get('fetchOHLCV', True):
                 continue
-
-            # --- 15m timeframe ---
-            df15 = fetch_candles(exchange, symbol, tf="15m", limit=200)
-            if df15.empty or len(df15) < 60:
-                continue
-
-            df15["ema9"] = get_ema(df15, 9)
-            df15["ema21"] = get_ema(df15, 21)
-            df15["ema50"] = get_ema(df15, 50)
-            df15["rsi"] = get_rsi(df15, rsi_len)
-            df15["atr14"] = get_atr(df15, atr_len)
-            df15 = get_supertrend(df15, atr_period=st_atr_period, multiplier=st_mult)
-
-            last15 = df15.iloc[-2]  # closed candle
-
-            if minutes_ago(last15["time"]) > max_age_minutes:
-                continue
-
-            # === ENTRY ===
-            if symbol not in open_positions:
-                trend_down = (
-                    last15["ema9"] < last15["ema21"]
-                    and last15["close"] < last15["ema9"]
-                    and last15["close"] < last15["ema21"]
-                )
-
-                supertrend_short = (not last15["in_uptrend"]) and (last15["close"] < last15["supertrend"])
-
-                # Volume confirmation
-                avg_vol = df15["volume"].iloc[-vol_window-2:-2].mean()
-                vol_ok = last15["volume"] > vol_mult * avg_vol
-
-                if trend_down and supertrend_short and vol_ok:
-                    entry_price = last15["close"]
-                    entry_atr = df15["atr14"].iloc[-2]
-                    if pd.isna(entry_atr) or entry_atr <= 0:
-                        continue
-
-                    tp_price = entry_price - atr_tp_mult * entry_atr
-                    sl_price = entry_price + atr_sl_mult * entry_atr
-
-                    open_positions[symbol] = {
-                        "exchange": ex_id.upper(),
-                        "entry": entry_price,
-                        "time": last15["time"],
-                        "tp": tp_price,
-                        "sl": sl_price
-                    }
-                    return {
-                        "type": "entry",
-                        "symbol": symbol,
-                        "exchange": ex_id.upper(),
-                        "price": entry_price,
-                        "tp": tp_price,
-                        "sl": sl_price
-                    }
-
-            # === EXIT ===
-            else:
-                pos = open_positions[symbol]
-                entry_price = pos["entry"]
-                tp_price = pos["tp"]
-                sl_price = pos["sl"]
-                price = last15["close"]
-
-                tp_hit = price <= tp_price
-                sl_hit = price >= sl_price
-                trend_flip = last15["ema9"] >= last15["ema21"] or last15["in_uptrend"]
-
-                if tp_hit or sl_hit or trend_flip:
-                    reason = "TP" if tp_hit else ("SL" if sl_hit else "TrendFlip")
-                    del open_positions[symbol]
-                    return {
-                        "type": "exit",
-                        "symbol": symbol,
-                        "exchange": pos["exchange"],
-                        "price": price,
-                        "reason": reason
-                    }
-
+            ohl = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if not ohl: continue
+            df = pd.DataFrame(ohl, columns=['ts', 'open','high','low','close','volume'])
+            df['datetime'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+            return df.dropna().sort_values('datetime').reset_index(drop=True), ex_id
         except Exception:
             continue
-    return None
+    return None, None
 
-# === Main ===
-def run_once():
-    signals, missing = [], []
-    for sym in tqdm(symbols, desc="Checking coins", unit="coin"):
-        result = evaluate(sym)
-        if result:
-            signals.append(result)
-        else:
-            missing.append(sym)
+def add_emas(df):
+    if df is None or df.empty: return df
+    df = df.copy()
+    df['EMA_21'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
+    df['EMA_50'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
+    return df
 
-    lines = [f"=== SHORT STRATEGY (15m Supertrend + EMA trend + Volume Surge; Exits: TP={atr_tp_mult}xATR, SL={atr_sl_mult}xATR) ==="]
-    if signals:
-        for s in signals:
-            if s["type"] == "entry":
-                lines.append(
-                    f"📉 ENTRY SHORT {s['symbol']} ({s['exchange']}) @ {s['price']:.6f} | TP={s['tp']:.6f} SL={s['sl']:.6f}"
-                )
-            elif s["type"] == "exit":
-                lines.append(
-                    f"✅ EXIT {s['symbol']} ({s['exchange']}) @ {s['price']:.6f} | Reason={s['reason']}"
-                )
-    else:
-        lines.append("No signals this run.")
+# ---------------- DETECTION ----------------
+def compute_1h_stats(df_1h):
+    df = df_1h.copy()
+    df['ret_pct'] = df['close'].pct_change() * 100
+    df['ret_mean'] = df['ret_pct'].rolling(ROLL_1H, min_periods=20).mean()
+    df['ret_std'] = df['ret_pct'].rolling(ROLL_1H, min_periods=20).std().replace(0, np.nan)
+    df['z_ret'] = (df['ret_pct'] - df['ret_mean']) / df['ret_std']
+    df['vol_mean_1h'] = df['volume'].rolling(ROLL_1H, min_periods=20).mean()
+    df['vol_std_1h'] = df['volume'].rolling(ROLL_1H, min_periods=20).std().replace(0, np.nan)
+    df['z_vol'] = (df['volume'] - df['vol_mean_1h']) / df['vol_std_1h']
+    return df
 
-    final_text = "\n".join(lines)
-    send_telegram_text_chunks(final_text)
-    print(final_text)
+def compute_15m_stats(df_15m):
+    df = df_15m.copy()
+    df['vol_mean_15m'] = df['volume'].rolling(ROLL_15M, min_periods=20).mean()
+    return df
+
+def detect_pumps_1h(df_1h_stats):
+    mask = (df_1h_stats['z_ret'] >= Z_RET_THRESHOLD) & (df_1h_stats['z_vol'] >= Z_VOL_THRESHOLD)
+    return df_1h_stats.index[mask].tolist()
+
+def is_15m_bearish_vol_spike(bar_15m):
+    rng = bar_15m['high'] - bar_15m['low']
+    if rng <= 0: return False
+    close_near_low = bar_15m['close'] <= bar_15m['low'] + BETA_CLOSE_NEAR_LOW * rng
+    bearish = bar_15m['close'] < bar_15m['open']
+    mean15 = bar_15m.get('vol_mean_15m', np.nan)
+    if pd.isna(mean15) or mean15 == 0: return False
+    vol_spike = bar_15m['volume'] >= VOL_MULT_15 * mean15
+    return bearish and close_near_low and vol_spike
+
+# ---------------- SCORING ----------------
+def compute_signal_score(pump_row, confirm_row):
+    zret = float(pump_row.get('z_ret', 0.0))
+    zvol = float(pump_row.get('z_vol', 0.0))
+    s1 = min(1.0, zret / 5.0)
+    s2 = min(1.0, zvol / 6.0)
+    vol_ratio = confirm_row['volume'] / max(confirm_row.get('vol_mean_15m', 1.0), 1.0)
+    s3 = min(1.0, vol_ratio / (VOL_MULT_15 * 2))
+    dt = (confirm_row['datetime'] - pump_row['datetime']).total_seconds() / 60.0
+    s4 = max(0.0, 1.0 - (dt / (WATCH_HOURS * 60.0)))
+    return float(0.35*s1 + 0.30*s2 + 0.25*s3 + 0.10*s4)
+
+# ---------------- MAIN ----------------
+def scan_once():
+    signals = []
+    for coin in tqdm(COIN_LIST, desc="Scanning coins", unit="coin"):
+        df_1h, ex1 = fetch_ohlcv_fallback(coin, '1h', limit=ROLL_1H+50)
+        if df_1h is None or len(df_1h) < ROLL_1H: continue
+        df_15m, ex15 = fetch_ohlcv_fallback(coin, '15m', limit=ROLL_15M+50)
+        if df_15m is None or len(df_15m) < 40: continue
+        df_1h_stats = add_emas(compute_1h_stats(df_1h))
+        df_15m_stats = add_emas(compute_15m_stats(df_15m))
+        pump_idx_list = detect_pumps_1h(df_1h_stats)
+        pump_idx_list = [i for i in pump_idx_list if i >= len(df_1h_stats)-24]
+        for pidx in pump_idx_list:
+            pump_row = df_1h_stats.iloc[pidx]
+            pump_time = pump_row['datetime']
+            watch_end = pump_time + timedelta(hours=WATCH_HOURS)
+            win15 = df_15m_stats[(df_15m_stats['datetime'] > pump_time) & (df_15m_stats['datetime'] <= watch_end)]
+            if win15.empty: continue
+            confirmed = None
+            for _, bar in win15.iterrows():
+                if is_15m_bearish_vol_spike(bar):
+                    confirmed = bar; break
+            if confirmed is not None:
+                score = compute_signal_score(pump_row, confirmed)
+                signals.append({
+                    'ticker': coin,
+                    'score': score
+                })
+    signals.sort(key=lambda x: x['score'], reverse=True)
+    return signals
 
 if __name__ == "__main__":
-    print("\n===== New Scan at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "=====")
-    run_once()
-    print("Run complete. Exiting.\n")
+    results = scan_once()
+    if not results:
+        print("No signals")
+    else:
+        for s in results:
+            print(s['ticker'])
