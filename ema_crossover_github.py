@@ -1,11 +1,14 @@
 """
-rt_github.py — Pump→Dump Screener (GitHub-friendly, single run)
----------------------------------------------------------------
+rt.py — Pump→Dump Screener (GitHub + Telegram)
+----------------------------------------------
+- Runs a single scan (no infinite loop)
 - Scans your meme coin list across multiple exchanges
 - Detects pump + confirm
-- Outputs ONLY ranked coin names (one per line, highest score first)
+- Prints ranked coin names to logs
+- Sends ranked coin names to Telegram
 
-Dependencies: pip install ccxt pandas numpy rich tqdm
+Dependencies:
+  pip install ccxt pandas numpy tqdm requests
 """
 
 import ccxt
@@ -14,7 +17,28 @@ import numpy as np
 from datetime import timedelta
 from tqdm import tqdm
 import warnings
+import os
+import requests
+
 warnings.filterwarnings("ignore")
+
+# ---------------- TELEGRAM CONFIG ----------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")   # store in GitHub Secrets
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def send_telegram_message(text: str):
+    """Send message to Telegram bot"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram not configured. Skipping send.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    try:
+        r = requests.post(url, data=data, timeout=10)
+        if r.status_code != 200:
+            print("Telegram send failed:", r.text)
+    except Exception as e:
+        print("Telegram error:", e)
 
 # ---------------- USER CONFIG ----------------
 COIN_LIST = [
@@ -151,7 +175,9 @@ def scan_once():
 if __name__ == "__main__":
     results = scan_once()
     if not results:
-        print("No signals")
+        msg = "No signals"
     else:
-        for s in results:
-            print(s['ticker'])
+        msg = "\n".join(s['ticker'] for s in results)
+
+    print(msg)
+    send_telegram_message(msg)
