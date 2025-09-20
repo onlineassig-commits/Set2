@@ -55,7 +55,7 @@ EXCHANGE_LIST = ['binance', 'bybit', 'okx', 'kucoin']
 
 ROLL_1H = 100
 ROLL_15M = 200
-WATCH_HOURS = 6
+WATCH_HOURS = 3
 
 # thresholds
 Z_RET_THRESHOLD = 1.8
